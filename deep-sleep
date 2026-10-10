@@ -1,0 +1,541 @@
+#!/bin/bash
+# macOS Bash 3.2 compatible. No external runtime dependencies.
+
+ds_diskutil() { /usr/sbin/diskutil "$@"; }
+ds_pmset() { /usr/bin/pmset "$@"; }
+ds_pause() { /bin/sleep "$1"; }
+ds_user_home() { printf '%s\n' "$HOME"; }
+ds_log() { printf 'deep-sleep: %s\n' "$*" >&2; }
+ds_die() { ds_log "$2"; exit "$1"; }
+
+ds_help() {
+    cat <<'EOF'
+Usage: deep-sleep [--volume VOLUME ... | --config FILE] [--dry-run]
+       deep-sleep --recover [--dry-run]
+       deep-sleep --help | --version | --skill [TOPIC]
+
+Unmount selected data volumes, request macOS sleep, then remount after full wake.
+VOLUME is an exact /Volumes/... mount point or a Volume UUID.
+
+Options:
+  -v, --volume VOLUME  Select a volume; repeat for multiple volumes. Replaces config.
+  -c, --config FILE    Read FILE instead of ~/.deep-sleep/.env.
+  -n, --dry-run        Inspect and print the plan without unmounting or sleeping.
+      --recover        Restore volumes recorded by an interrupted/failed run.
+  -h, --help           Show this human-readable guide.
+      --version        Print version.
+      --skill [TOPIC]  Print built-in Markdown agent instructions; default: overview.
+                      Topics: overview, sleep, configuration, recovery.
+
+Examples:
+  deep-sleep --dry-run --volume "/Volumes/My Backup"
+  deep-sleep --volume /Volumes/Archive --volume /Volumes/Backup
+  deep-sleep --config ./nightly.env
+  deep-sleep --skill configuration
+
+Default config (~/.deep-sleep/.env):
+  DEEP_SLEEP_VOLUME_1="/Volumes/Archive"
+  DEEP_SLEEP_VOLUME_2="/Volumes/Backup"
+Values are literal data, not shell code. See --skill configuration for the grammar.
+
+Normal unmount only; no force, eject, sudo, or changes to power settings.
+Only initially mounted volumes are restored. Keep this process running until wake.
+Pending recovery blocks a new sleep run. State: ~/.deep-sleep/state/.
+
+Exit codes: 0 success; 2 usage/config; 3 preflight; 4 unmount/sleep request;
+            5 wake unconfirmed; 6 recovery incomplete; 7 locked/pending state;
+            129/130/143 interrupted (HUP/INT/TERM).
+EOF
+}
+
+ds_skill() {
+    local topic=${1:-overview}
+    case "$topic" in
+        overview|sleep|configuration|recovery) ;;
+        *) ds_die 2 "Unknown skill topic: $topic. Topics: overview, sleep, configuration, recovery." ;;
+    esac
+    printf -- '---\nname: deep-sleep-%s\ndescription: Built-in macOS deep-sleep CLI instructions for agents.\n---\n\n' "$topic"
+    case "$topic" in
+        overview)
+            cat <<'EOF'
+# deep-sleep
+Use this CLI when the user wants selected macOS data volumes unmounted before
+standard system sleep and restored after full wake. It uses diskutil and
+pmset sleepnow. It does not change hibernation settings or install a daemon.
+
+## Workflow
+1. Obtain the intended volumes from the user or ~/.deep-sleep/.env.
+2. Run `deep-sleep --dry-run` with the same config/volume arguments as execution.
+3. Check the resolved UUIDs and mounted state. Run the real command only within
+   the user's authorization to unmount those volumes and sleep the machine.
+4. Allow the foreground process to remain alive through sleep and wake.
+5. Check the exit code. For pending state, read `deep-sleep --skill recovery`.
+
+## Topics
+- `deep-sleep --skill sleep`: execution, wake detection, failures, exit codes.
+- `deep-sleep --skill configuration`: config grammar and argument precedence.
+- `deep-sleep --skill recovery`: interrupted runs and mounting retries.
+
+Help, version, and skill output require no disk or power access. Plans/help/skills
+go to stdout; progress and diagnostics go to stderr. Do not automatically use
+sudo, force-unmount, delete state, or replace a failed target with another disk.
+EOF
+            ;;
+        sleep)
+            cat <<'EOF'
+# Run a sleep cycle
+## Preconditions
+macOS with /bin/bash, diskutil, pmset and PlistBuddy. Targets must have VolumeUUIDs.
+Mounted targets must live below /Volumes. Network shares, system volumes, locked
+volumes without readable metadata, and custom mount points are unsupported.
+
+## Commands
+```sh
+deep-sleep --dry-run --volume "/Volumes/My Backup"
+deep-sleep --volume "/Volumes/My Backup" --volume /Volumes/Archive
+deep-sleep                         # use ~/.deep-sleep/.env
+```
+
+## Behavior
+Validate every target before any unmount. Deduplicate by UUID. Skip volumes that
+were already unmounted. Record recovery intent before each normal unmount.
+On unmount failure, cancel sleep and restore earlier targets. On pmset failure,
+restore targets. Read-only volumes are mounted read-only. Re-resolve UUIDs after
+wake; BSD device numbers may have changed. Mount locations follow macOS defaults.
+
+A return from pmset sleepnow is not a wake signal. The CLI polls pmset -g log for
+a new sleep record followed by full Wake in that cycle, and checks systemstate
+for CPU/Graphics with no pending transition. DarkWake and Wake Requests do not
+qualify. Missing sleep evidence after 30 polls (2-second pauses), unreadable logs,
+or interruption after requesting sleep leave a recovery journal instead of
+guessing that mounting is safe. Once sleep is observed, waiting for full wake
+has no timeout. This is a log-based observer, not an OS notification daemon.
+
+## Results
+0: completed; 2: arguments/config; 3: preflight failed; 4: unmount/sleep request
+failed (rollback attempted); 5: wake unconfirmed; 6: restore incomplete;
+7: concurrent run or pending journal; 129/130/143: HUP/INT/TERM.
+Use `deep-sleep --recover` only when awake and recovery is intended. Do not retry
+a real sleep command blindly. SIGKILL, shutdown and terminal loss can interrupt
+automatic restoration; review the recovery topic.
+EOF
+            ;;
+        configuration)
+            cat <<'EOF'
+# Configure volumes
+## File
+Default: ~/.deep-sleep/.env. `--config FILE` selects another file. Repeated
+`--volume VOLUME` arguments replace the entire config list; no config is read
+when explicit volumes are supplied, even when --config is also present.
+Environment variables named DEEP_SLEEP_VOLUME_* are not imported.
+
+```dotenv
+# Numbers identify entries; processing follows file order.
+DEEP_SLEEP_VOLUME_1="/Volumes/My Backup"
+DEEP_SLEEP_VOLUME_2='01234567-89AB-CDEF-0123-456789ABCDEF'
+```
+
+## Grammar
+One DEEP_SLEEP_VOLUME_<positive integer>=value per line. No leading zeroes.
+Blank lines, CRLF, full-line # comments, spaces around =, and single/double
+quotes are accepted. Unquoted values must not contain whitespace, quotes or #.
+Quoted values are literal single-line strings; matching inner quotes and escape
+sequences are unsupported. No inline comments, export, interpolation, commands,
+or multiline values. The parser never sources/evaluates the file. Unknown keys,
+duplicate keys, empty values, and malformed lines are errors.
+
+Use an exact mount point below /Volumes or a Volume UUID. Prefer UUIDs in lasting
+configuration: inspect `diskutil info /Volumes/Archive` and copy Volume UUID.
+Quote paths containing spaces. Do not use diskNsM identifiers, volume names,
+~ expansion or ${VARIABLE} references. Missing/empty configuration is an error.
+
+## Verify
+`deep-sleep --dry-run --config ./nightly.env` prints the source and resolved UUIDs
+without writing a recovery journal, mounting, unmounting, or sleeping.
+EOF
+            ;;
+        recovery)
+            cat <<'EOF'
+# Recover mounts
+## Commands
+```sh
+deep-sleep --recover --dry-run
+deep-sleep --recover
+```
+Recovery reads ~/.deep-sleep/state/pending, independent of current volume config.
+It only mounts recorded UUIDs, never sleeps, and skips those already mounted.
+Each record was an initially mounted volume, saved before attempting unmount;
+an interrupted unmount may therefore already be mounted. Read-only mode is kept.
+Mount attempts retry up to five times per volume with 2-second pauses. Disconnected
+or locked volumes can fail; reconnect/unlock them and rerun recovery. Failures keep
+the journal and return 6. Success removes it. A new sleep run refuses pending state.
+
+## Interrupted processes
+Before the sleep request, HUP/INT/TERM attempts rollback. After the request, signals
+leave the journal to avoid mounting before an uncertain sleep transition. SIGKILL
+cannot be trapped. After checking the computer is fully awake, run recovery.
+
+## Lock
+~/.deep-sleep/state/lock prevents concurrent runs for this user. If a process was
+killed abruptly, inspect lock/pid and verify that process is no longer running.
+Only then remove lock/pid and the empty lock directory and run --recover. Never
+remove a live lock or pending journal merely to bypass an error. The CLI does not
+automatically break stale locks or coordinate with other users or disk utilities.
+EOF
+            ;;
+    esac
+}
+
+ds_trim() {
+    ds_trimmed=${1#"${1%%[![:space:]]*}"}
+    ds_trimmed=${ds_trimmed%"${ds_trimmed##*[![:space:]]}"}
+}
+
+ds_read_config() {
+    local line key value quote number=0 seen='|' re='^DEEP_SLEEP_VOLUME_[1-9][0-9]*$'
+    [[ -f $ds_config && -r $ds_config ]] || ds_die 2 "Cannot read config: $ds_config. Use --help for an example."
+    while IFS= read -r line || [[ -n $line ]]; do
+        number=$((number + 1))
+        ds_trim "${line%$'\r'}"; line=$ds_trimmed
+        [[ -z $line || $line == \#* ]] && continue
+        [[ $line == *=* ]] || ds_die 2 "$ds_config:$number: expected KEY=value."
+        ds_trim "${line%%=*}"; key=$ds_trimmed
+        [[ $key =~ $re ]] || ds_die 2 "$ds_config:$number: unknown or malformed key: $key"
+        [[ $seen != *"|$key|"* ]] || ds_die 2 "$ds_config:$number: duplicate key: $key"
+        seen="$seen$key|"
+        ds_trim "${line#*=}"; value=$ds_trimmed
+        case "$value" in
+            \"*|\'*)
+                quote=${value:0:1}
+                [[ ${#value} -ge 2 && ${value: -1} == "$quote" ]] || ds_die 2 "$ds_config:$number: unclosed quote."
+                value=${value:1:${#value}-2}
+                [[ $value != *"$quote"* ]] || ds_die 2 "$ds_config:$number: inner quotes/inline comments are unsupported."
+                ;;
+            *)
+                [[ $value != *[[:space:]\"\'\#]* ]] || ds_die 2 "$ds_config:$number: quote the entire value; inline comments are unsupported."
+                ;;
+        esac
+        [[ -n $value ]] || ds_die 2 "$ds_config:$number: empty volume."
+        ds_targets[${#ds_targets[@]}]=$value
+    done < "$ds_config"
+}
+
+ds_is_uuid() { [[ $1 =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; }
+ds_plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$ds_tmp/info.plist" 2>/dev/null; }
+ds_info() { ds_diskutil info -plist "$1" > "$ds_tmp/info.plist" < /dev/null; }
+
+# Compare filesystem identity, not lowercased strings: case-sensitive volumes
+# can contain genuinely different directories whose names differ only in case.
+ds_same_directory() { [[ -d $1 && -d $2 && $1 -ef $2 ]]; }
+
+# The human-readable "Mounted" label is not a plist key. diskutil info
+# represents an unmounted volume with an empty MountPoint string.
+ds_mount_status() {
+    local point
+    point=$(ds_plist MountPoint) || return 1
+    case "$point" in
+        '') printf 'false\n' ;;
+        /*) printf 'true\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+ds_preflight() {
+    local target uuid mounted point writable whole seen='|'
+    for target in "${ds_targets[@]}"; do
+        if ! ds_is_uuid "$target"; then
+            [[ $target == /Volumes/?* && $target != *$'\n'* && $target != *$'\r'* ]] || ds_die 2 "Expected a Volume UUID or exact /Volumes/... mount point: $target"
+        fi
+        ds_info "$target" || ds_die 3 "Cannot inspect volume: $target"
+        uuid=$(ds_plist VolumeUUID) || ds_die 3 "Volume has no VolumeUUID: $target"
+        ds_is_uuid "$uuid" || ds_die 3 "Invalid VolumeUUID for: $target"
+        uuid=$(printf '%s' "$uuid" | tr '[:lower:]' '[:upper:]')
+        if ds_is_uuid "$target"; then
+            [[ $(printf '%s' "$target" | tr '[:lower:]' '[:upper:]') == "$uuid" ]] || ds_die 3 "Resolved UUID does not match target: $target"
+        fi
+        whole=$(ds_plist WholeDisk) || ds_die 3 "Missing WholeDisk flag: $target"
+        [[ $whole == true || $whole == false ]] || ds_die 3 "Invalid WholeDisk flag: $target"
+        [[ $whole == false ]] || ds_die 3 "Expected an individual volume, not a whole disk: $target"
+        mounted=$(ds_mount_status) || ds_die 3 "Missing or invalid MountPoint: $target"
+        writable=true
+        if [[ $mounted == true ]]; then
+            point=$(ds_plist MountPoint) || ds_die 3 "Missing mount point: $target"
+            [[ $point == /Volumes/?* ]] || ds_die 3 "Only data volumes mounted below /Volumes are supported: $target ($point)"
+            if ! ds_is_uuid "$target"; then
+                if [[ ${target%/} != "$point" ]] && ! ds_same_directory "$target" "$point"; then
+                    ds_die 3 "Use the exact mount point, not a subdirectory: $point"
+                fi
+            fi
+            writable=$(ds_plist WritableVolume) || ds_die 3 "Cannot determine read-only status: $target"
+            [[ $writable == true || $writable == false ]] || ds_die 3 "Invalid WritableVolume flag: $target"
+        elif ! ds_is_uuid "$target"; then
+            ds_die 3 "An unmounted volume must be selected by UUID: $target"
+        fi
+        [[ $seen == *"|$uuid|"* ]] && continue
+        seen="$seen$uuid|"
+        if [[ $mounted == true ]]; then
+            ds_uuids[${#ds_uuids[@]}]=$uuid
+            if [[ $writable == false ]]; then ds_modes[${#ds_modes[@]}]=readOnly
+            else ds_modes[${#ds_modes[@]}]=readWrite; fi
+            printf 'Unmount, then restore: %s (%s; %s)\n' "$target" "$uuid" "${ds_modes[${#ds_modes[@]}-1]}"
+        else
+            printf 'Skip already unmounted: %s (%s)\n' "$target" "$uuid"
+        fi
+    done
+}
+
+# Return the last cycle and ordered sleep/wake evidence. Duration columns can
+# change retroactively, so identities use cycle UUID plus timestamp only.
+ds_power_log() {
+    ds_pmset -g log > "$ds_tmp/power.log" || return 1
+    ds_power=$(awk '
+        /^UUID: / { cycle=$2; slept="-"; woke="-"; state="none"; recognized=1 }
+        /^Showing all currently held IOKit power assertions/ { recognized=1 }
+        /^Total Sleep\/Wakes since boot/ { recognized=1 }
+        $1 ~ /^[0-9][0-9][0-9][0-9]-/ && cycle != "" {
+            stamp=$1 "T" $2 $3
+            if ($4=="Sleep" && $5=="Entering" && $6=="Sleep") {
+                slept=stamp; woke="-"; state="sleep"
+            } else if ($4=="DarkWake" && $5=="DarkWake") {
+                state="dark"
+            } else if ($4=="Wake" && ($5=="Wake" || ($5=="DarkWake" && $6=="to" && $7=="FullWake"))) {
+                woke=stamp; state="wake"
+            }
+        }
+        END {
+            if (!recognized) exit 1
+            if (cycle=="") print "none|-|-|none"
+            else print cycle "|" slept "|" woke "|" state
+        }
+    ' "$ds_tmp/power.log") || return 1
+    IFS='|' read -r ds_cycle ds_slept ds_woke ds_power_kind <<< "$ds_power"
+    [[ $ds_cycle == none ]] || ds_is_uuid "$ds_cycle"
+}
+
+ds_full_wake() {
+    local state
+    state=$(ds_pmset -g systemstate) || return 2
+    [[ $state == *'Current System Capabilities are:'* && $state == *'Current Power State:'* ]] || return 2
+    [[ $state == *'CPU'* && $state == *'Graphics'* && $state == *'Current Power State: 4'* && $state != *'Desired State:'* && $state != *'System State is changing'* ]]
+}
+
+ds_lock() {
+    [[ ! -L $ds_state ]] || ds_die 7 "State directory must not be a symlink: $ds_state"
+    mkdir -p "$ds_state" || ds_die 7 "Cannot create state directory: $ds_state"
+    [[ -O $ds_state ]] || ds_die 7 "State directory must be owned by the current user."
+    chmod 700 "$ds_state" || ds_die 7 "Cannot secure state directory."
+    mkdir "$ds_state/lock" 2>/dev/null || ds_die 7 "State is locked: $ds_state/lock. See --skill recovery."
+    ds_locked=1
+    printf '%s\n' "$$" > "$ds_state/lock/pid" || ds_die 7 "Cannot write lock owner."
+}
+
+ds_load_pending() {
+    local uuid mode extra seen='|'
+    ds_uuids=(); ds_modes=()
+    [[ -f $ds_pending && ! -L $ds_pending && -r $ds_pending ]] || ds_die 7 "Invalid recovery journal: $ds_pending"
+    while IFS=' ' read -r uuid mode extra || [[ -n $uuid ]]; do
+        ds_is_uuid "$uuid" && [[ $mode == readOnly || $mode == readWrite ]] && [[ -z $extra ]] || ds_die 7 "Invalid recovery journal; inspect manually: $ds_pending"
+        [[ $seen != *"|$uuid|"* ]] || ds_die 7 "Duplicate UUID in recovery journal."
+        seen="$seen$uuid|"
+        ds_uuids[${#ds_uuids[@]}]=$uuid; ds_modes[${#ds_modes[@]}]=$mode
+    done < "$ds_pending"
+}
+
+ds_mounted() {
+    local uuid mounted
+    ds_info "$1" 2>/dev/null || return 1
+    uuid=$(ds_plist VolumeUUID) || return 1
+    uuid=$(printf '%s' "$uuid" | tr '[:lower:]' '[:upper:]')
+    [[ $uuid == "$1" ]] || return 1
+    mounted=$(ds_mount_status) || return 1
+    [[ $mounted == true ]]
+}
+
+ds_restore() {
+    local uuid mode extra attempt success failed=0
+    [[ -f $ds_pending ]] || return 0
+    while IFS=' ' read -r uuid mode extra || [[ -n $uuid ]]; do
+        # Even automatic rollback must not act on a partial journal write.
+        if ! ds_is_uuid "$uuid" || [[ $mode != readOnly && $mode != readWrite ]] || [[ -n $extra ]]; then
+            ds_log "Invalid recovery record; journal retained for inspection: $ds_pending"
+            return 1
+        fi
+        uuid=$(printf '%s' "$uuid" | tr '[:lower:]' '[:upper:]')
+        success=0
+        for ((attempt=1; attempt<=5; attempt++)); do
+            if ds_mounted "$uuid"; then success=1; break; fi
+            ds_log "Mounting $uuid ($mode; attempt $attempt/5)."
+            if [[ $mode == readOnly ]]; then
+                ds_diskutil mount readOnly "$uuid" < /dev/null >&2
+            else
+                ds_diskutil mount "$uuid" < /dev/null >&2
+            fi
+            if ds_mounted "$uuid"; then success=1; break; fi
+            ((attempt < 5)) && ds_pause 2
+        done
+        if ((success)); then ds_log "Restored $uuid."
+        else
+            ds_log "Could not restore $uuid. Reconnect/unlock the volume, then run deep-sleep --recover."
+            failed=1
+        fi
+    done < "$ds_pending"
+    if ((failed)); then return 1; fi
+    rm "$ds_pending" || return 1
+    return 0
+}
+
+ds_cleanup() {
+    local status=$?
+    trap - EXIT
+    # Further signals must not interrupt the best-effort rollback.
+    trap '' HUP INT TERM
+    if [[ $ds_phase == preparing && -f $ds_pending ]]; then
+        ds_log 'Restoring volumes after an interrupted or failed preparation.'
+        ds_restore || status=6
+    elif [[ $ds_phase == requested && -f $ds_pending ]]; then
+        ds_log 'Wake is unconfirmed; volumes remain recorded for deep-sleep --recover.'
+    fi
+    [[ -n $ds_tmp ]] && rm -rf "$ds_tmp"
+    if ((ds_locked)); then
+        rm -f "$ds_state/lock/pid"
+        rmdir "$ds_state/lock" || ds_log "Could not remove lock: $ds_state/lock"
+    fi
+    exit "$status"
+}
+
+ds_wait_for_wake() {
+    local baseline=$1 polls=0 observed=0 full_status
+    while :; do
+        ds_power_log || ds_die 5 "Cannot read/parse power history after sleep request."
+        if [[ $ds_slept != - && "$ds_cycle|$ds_slept" != "$baseline" ]]; then
+            observed=1
+            if [[ $ds_power_kind == wake && $ds_woke != - ]]; then
+                ds_full_wake; full_status=$?
+                ((full_status == 2)) && ds_die 5 "Cannot read current power state."
+                if ((full_status == 0)); then return 0; fi
+            fi
+        fi
+        polls=$((polls + 1))
+        if (( !observed && polls >= 30 )); then
+            ds_die 5 "No new sleep evidence after 30 polls. Check pmset -g log; use --recover when awake."
+        fi
+        ds_pause 2
+    done
+}
+
+ds_main() {
+    # Predictable system utilities; tests replace only the ds_* adapters after sourcing.
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin
+    export PATH LC_ALL=C
+    umask 077
+    ds_targets=(); ds_uuids=(); ds_modes=()
+    ds_dry=0; ds_recover=0; ds_locked=0; ds_tmp=''; ds_phase=idle
+    local base info_mode='' topic=overview op_args=0 explicit_config=0 arg i baseline current_uuid current_mounted current_writable expected_writable
+    base=$(ds_user_home) || return 3
+    [[ -n $base && $base == /* ]] || ds_die 3 'Cannot determine an absolute home directory.'
+    ds_config="$base/.deep-sleep/.env"
+    ds_state="$base/.deep-sleep/state"; ds_pending="$ds_state/pending"
+    while (($#)); do
+        arg=$1; shift
+        case "$arg" in
+            -v|--volume|-c|--config)
+                (($#)) && [[ -n $1 && $1 != -* ]] || ds_die 2 "Missing value for $arg."
+                if [[ $arg == -v || $arg == --volume ]]; then ds_targets[${#ds_targets[@]}]=$1
+                else ds_config=$1; explicit_config=1; fi
+                shift; op_args=1 ;;
+            --volume=*)
+                [[ -n ${arg#*=} ]] || ds_die 2 'Empty --volume.'
+                ds_targets[${#ds_targets[@]}]=${arg#*=}; op_args=1 ;;
+            --config=*)
+                ds_config=${arg#*=}; [[ -n $ds_config ]] || ds_die 2 'Empty --config.'
+                explicit_config=1; op_args=1 ;;
+            -n|--dry-run) ds_dry=1; op_args=1 ;;
+            --recover) ds_recover=1; op_args=1 ;;
+            -h|--help|--version|--skill|--skill=*)
+                [[ -z $info_mode ]] || ds_die 2 'Use only one of --help, --version, --skill.'
+                info_mode=$arg
+                if [[ $arg == --skill=* ]]; then topic=${arg#*=}; info_mode=--skill
+                elif [[ $arg == --skill && $# -gt 0 && $1 != -* ]]; then topic=$1; shift; fi
+                ;;
+            --) (($# == 0)) || ds_die 2 'Positional arguments are unsupported; use --volume.' ;;
+            *) ds_die 2 "Unknown argument: $arg. Use --help." ;;
+        esac
+    done
+    if [[ -n $info_mode ]]; then
+        ((op_args == 0)) || ds_die 2 'Help/version/skill options cannot be combined with operations.'
+        case "$info_mode" in
+            -h|--help) ds_help ;;
+            --version) printf 'deep-sleep 0.1.0\n' ;;
+            --skill) [[ -n $topic ]] || ds_die 2 'Empty skill topic.'; ds_skill "$topic" ;;
+        esac
+        return 0
+    fi
+    [[ $(uname -s) == Darwin ]] || ds_die 3 'deep-sleep requires macOS.'
+    if ((ds_recover)); then
+        ((${#ds_targets[@]} == 0 && explicit_config == 0)) || ds_die 2 '--recover uses its journal; omit --volume and --config.'
+    else
+        if ((${#ds_targets[@]})); then printf 'Source: command-line volumes (config ignored)\n'
+        else printf 'Source: %s\n' "$ds_config"; ds_read_config; fi
+        ((${#ds_targets[@]})) || ds_die 2 'No volumes configured. Use --help for an example.'
+    fi
+    ds_tmp=$(mktemp -d /private/tmp/deep-sleep.XXXXXXXX) || ds_die 3 'Cannot create temporary directory.'
+    trap ds_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if (( !ds_dry )); then ds_lock; fi
+    if ((ds_recover)); then
+        if [[ ! -e $ds_pending && ! -L $ds_pending ]]; then ds_log 'No pending recovery.'; return 0; fi
+        ds_load_pending
+        for ((i=0; i<${#ds_uuids[@]}; i++)); do
+            printf 'Restore if unmounted: %s (%s)\n' "${ds_uuids[i]}" "${ds_modes[i]}"
+        done
+        ((ds_dry)) && return 0
+        ds_full_wake || ds_die 5 'Recovery requires a full wake with no pending power transition.'
+        ds_phase=restoring
+        ds_restore || ds_die 6 'Recovery incomplete; journal retained.'
+        return 0
+    fi
+    [[ ! -e $ds_pending && ! -L $ds_pending ]] || ds_die 7 'Pending recovery exists. Use --recover before another sleep run.'
+    ds_preflight
+    ds_power_log || ds_die 3 'Cannot read/parse pmset power history; no volumes were unmounted.'
+    ds_full_wake || ds_die 3 'Start deep-sleep while the system is fully awake, with no pending power transition.'
+    printf 'Then: pmset sleepnow; wait for a new sleep/full-wake cycle; restore recorded volumes.\n'
+    ((ds_dry)) && return 0
+    ds_phase=preparing
+    for ((i=0; i<${#ds_uuids[@]}; i++)); do
+        # Recheck identity/state immediately before writing intent and unmounting.
+        ds_info "${ds_uuids[i]}" || ds_die 4 'A target disappeared before unmount.'
+        current_uuid=$(ds_plist VolumeUUID)
+        current_uuid=$(printf '%s' "$current_uuid" | tr '[:lower:]' '[:upper:]')
+        current_mounted=$(ds_mount_status) || ds_die 4 'Cannot determine mount status before unmount; sleep cancelled.'
+        current_writable=$(ds_plist WritableVolume)
+        expected_writable=true; [[ ${ds_modes[i]} == readOnly ]] && expected_writable=false
+        [[ $current_uuid == "${ds_uuids[i]}" && $current_mounted == true && $current_writable == "$expected_writable" ]] || ds_die 4 'A target changed since preflight; cancelling sleep.'
+        printf '%s %s\n' "${ds_uuids[i]}" "${ds_modes[i]}" >> "$ds_pending" || ds_die 4 'Cannot save recovery intent.'
+        ds_log "Unmounting ${ds_uuids[i]}."
+        ds_diskutil unmount "${ds_uuids[i]}" < /dev/null >&2 || ds_die 4 "Unmount failed: ${ds_uuids[i]}. Sleep cancelled."
+        ds_info "${ds_uuids[i]}" || ds_die 4 'Cannot verify unmount; sleep cancelled.'
+        current_mounted=$(ds_mount_status) || ds_die 4 'Cannot determine mount status after unmount; sleep cancelled.'
+        [[ $current_mounted == false ]] || ds_die 4 'Volume is still mounted; sleep cancelled.'
+    done
+    ds_power_log || ds_die 4 'Cannot capture power baseline; sleep cancelled.'
+    baseline="$ds_cycle|$ds_slept"
+    ds_full_wake || ds_die 4 'Power state changed during preparation; sleep cancelled.'
+    ds_phase=requested
+    ds_log 'Requesting sleep; waiting for full wake before restoring volumes.'
+    if ! ds_pmset sleepnow >&2; then
+        ds_phase=preparing
+        ds_die 4 'pmset sleepnow failed; attempting rollback.'
+    fi
+    ds_wait_for_wake "$baseline"
+    ds_phase=restoring
+    ds_log 'Full wake confirmed; restoring volumes.'
+    ds_restore || ds_die 6 'Restore incomplete; journal retained. Use --recover.'
+    ds_phase=done
+    ds_log 'Sleep cycle complete.'
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    ds_main "$@"
+fi
