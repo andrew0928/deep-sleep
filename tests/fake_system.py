@@ -33,9 +33,25 @@ if tool == "same-directory":
 
 if tool == "diskutil":
     verb = args[0]
+    if verb == "list":
+        physical = {"DeviceIdentifier": "disk4", "Partitions": [
+            {"DeviceIdentifier": "disk4s2"}]}
+        apfs = {"DeviceIdentifier": "disk5", "APFSPhysicalStores": [
+            {"DeviceIdentifier": state.get("physical_store", "disk4s2")}], "APFSVolumes": [
+            {"DeviceIdentifier": f"disk5s{i + 1}", **({"MountPoint": v["path"]} if v["mounted"] else {})}
+            for i, v in enumerate(state["volumes"])]}
+        result = {"AllDisksAndPartitions": [physical] if "physical" in args else [physical, apfs]}
+        save()
+        sys.stdout.buffer.write(plistlib.dumps(result))
+        sys.exit(0)
     target = args[-1]
+    if target == "disk4s2" and verb == "info":
+        save()
+        sys.stdout.buffer.write(plistlib.dumps({"MountPoint": ""}))
+        sys.exit(0)
     volume = next(
-        (v for v in state["volumes"] if target.rstrip("/").upper() == v["uuid"]
+        (v for i, v in enumerate(state["volumes"]) if target == f"disk5s{i + 1}"
+         or target.rstrip("/").upper() == v["uuid"]
          or target.rstrip("/") == v["path"] or target in v.get("aliases", [])), None
     )
     if volume is None:
@@ -50,7 +66,7 @@ if tool == "diskutil":
             "WholeDisk": volume.get("whole", False),
             "MountPoint": volume["path"] if volume["mounted"] else "",
             "WritableVolume": volume.get("writable", True),
-            "DeviceIdentifier": "disk99s1" if state.get("requested") else "disk4s1",
+            "DeviceIdentifier": "disk99s1" if state.get("requested") else target,
         }
         for key in volume.get("missing_keys", []):
             result.pop(key, None)
@@ -67,7 +83,8 @@ if tool == "diskutil":
         finish()
     if verb == "mount":
         volume["attempts"] = volume.get("attempts", 0) + 1
-        if volume.get("mount_fail") or volume["attempts"] < volume.get("mount_after", 1):
+        if (volume.get("mount_fail") or (volume.get("unavailable_after_sleep") and state.get("requested"))
+                or volume["attempts"] < volume.get("mount_after", 1)):
             finish(1, "Mock: not ready")
         # A success exit alone is insufficient; the CLI must verify Mounted.
         if not volume.get("mount_lies"):
