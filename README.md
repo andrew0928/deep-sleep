@@ -8,6 +8,14 @@
 
 ## 快速開始
 
+一行安裝（repository 公開後可直接使用）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/andrew0928/deep-sleep/main/install.sh | sh
+```
+
+安裝器只支援 macOS，將 CLI 安裝至 `~/.local/bin/deep-sleep`，並在設定不存在時建立 `~/.deep-sleep/.env` 範本。重複執行可更新 CLI，既有設定會保留；不需 `sudo`。安裝後先修改範本中的 volumes，再執行 `~/.local/bin/deep-sleep --dry-run`。安裝器會提供 PATH 設定指引，不自動修改 shell 設定，也不會卸載磁碟或觸發睡眠。
+
 在一般 macOS 終端機中執行：
 
 ```sh

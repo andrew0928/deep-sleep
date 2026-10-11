@@ -91,11 +91,11 @@ DEEP_SLEEP_VOLUME_2="01234567-89AB-CDEF-0123-456789ABCDEF"
 - [x] 卸載失敗回復、唯讀恢復、UUID 去重、掛載重試與中斷恢復的模擬測試。
 - [x] `sleepnow` 提早返回、DarkWake、完整喚醒尚未就緒及逾時不掛載的模擬測試。
 - [x] 修正 plist 欄位與掛載點大小寫問題；確認兩種大小寫路徑指向同一目錄。
-- [ ] 使用者端 `SG-Backup` 的 dry-run 成功驗收。
+- [x] 真機 `SG-Backup` 的 dry-run 成功驗收。
 - [ ] 真實卸載 → 睡眠 → 喚醒 → 掛載的完整循環驗收。
 - [ ] 真機驗證忙碌磁碟取消睡眠、磁碟離線後可重新連接並恢復。
 
-目前共有 38 個測試通過。開發環境無法存取 DiskManagement，尚未完成真實磁碟睡眠循環；目前也尚未收到使用者端最後一次 dry-run 成功的回報。
+CLI 的 38 個模擬測試通過。更新權限後，已完成包含 SG-Backup、WD-TimeMachine、WD-Temp、T500-Media、T500-Work 的真機 dry-run；尚未完成真實磁碟睡眠循環。
 
 ## 7. 版本控制與 GitHub 交付
 
@@ -103,4 +103,8 @@ DEEP_SLEEP_VOLUME_2="01234567-89AB-CDEF-0123-456789ABCDEF"
 
 認證應交由使用者輸入。開啟認證流程時使用系統預設瀏覽器，不指定瀏覽器；使用者慣用 Edge，以保留其既有登入資訊。不得將 credential、token 或使用者實際 `.env` 加入 repository。
 
-交付驗收須確認遠端為 `andrew0928/deep-sleep`、visibility 為 private，且提交內容已成功上傳。
+第一版已推送至 `andrew0928/deep-sleep`，當時確認 visibility 為 private；後續使用者決定自行改為 public，供一行安裝使用。
+
+## 8. 其他電腦的安裝
+
+使用者決定新增 `curl -fsSL …/install.sh | sh` 安裝方式，並將自行把 repository 改為 public，讓其他使用者不需 clone repository 即可安裝。安裝器支援 macOS，安裝至 `~/.local/bin/deep-sleep`；缺少設定時建立範本，已有設定時保留。提供 PATH 與修改 volumes 的指引，不自動修改 shell 設定或執行睡眠。
